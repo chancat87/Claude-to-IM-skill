@@ -17,7 +17,7 @@ import type { LLMProvider } from 'claude-to-im/src/lib/bridge/host.js';
 import { loadConfig, configToSettings, CTI_HOME } from './config.js';
 import type { Config } from './config.js';
 import { JsonFileStore } from './store.js';
-import { SDKLLMProvider, resolveClaudeCliPath } from './llm-provider.js';
+import { SDKLLMProvider, resolveClaudeCliPath, preflightCheck } from './llm-provider.js';
 import { PendingPermissions } from './permission-gateway.js';
 import { setupLogger } from './logger.js';
 
@@ -62,6 +62,23 @@ async function resolveProvider(config: Config, pendingPerms: PendingPermissions)
     process.exit(1);
   }
   console.log(`[claude-to-im] Using Claude CLI: ${cliPath}`);
+
+  // Preflight: verify the CLI can actually run in the daemon environment
+  const check = preflightCheck(cliPath);
+  if (check.ok) {
+    console.log(`[claude-to-im] CLI preflight OK (${check.version})`);
+  } else {
+    console.error(
+      `[claude-to-im] WARNING: Claude CLI preflight check failed!\n` +
+      `  ${check.error}\n` +
+      `  The bridge will start, but message processing may fail.\n` +
+      `  Common fixes:\n` +
+      `    1. Run 'claude auth login' to authenticate\n` +
+      `    2. Ensure the CLI version is compatible with SDK\n` +
+      `    3. Check ~/.claude-to-im/logs/bridge.log for details`,
+    );
+  }
+
   return new SDKLLMProvider(pendingPerms, cliPath, config.autoApprove);
 }
 
@@ -97,6 +114,8 @@ async function main(): Promise<void> {
   const pendingPerms = new PendingPermissions();
   const llm = await resolveProvider(config, pendingPerms);
   console.log(`[claude-to-im] Runtime: ${config.runtime}`);
+  console.log(`[claude-to-im] Environment: PATH=${process.env.PATH?.substring(0, 200) || '(empty)'}`);
+  console.log(`[claude-to-im] Environment: CLAUDECODE=${process.env.CLAUDECODE || '(unset)'}`);
 
   const gateway = {
     resolvePendingPermission: (id: string, resolution: { behavior: 'allow' | 'deny'; message?: string }) =>

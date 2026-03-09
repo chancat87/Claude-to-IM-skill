@@ -30,6 +30,30 @@ const ENV_WHITELIST = new Set([
 /** Prefixes that are always stripped (even in inherit mode). */
 const ENV_ALWAYS_STRIP = ['CLAUDECODE'];
 
+// ── Auth-error detection ──
+
+const AUTH_ERROR_PATTERNS = [
+  /not logged in/i,
+  /please run \/login/i,
+  /loggedIn['":\s]*false/i,
+];
+
+/** Check if an error message or stderr indicates a CLI auth failure. */
+export function isAuthError(text: string): boolean {
+  return AUTH_ERROR_PATTERNS.some(re => re.test(text));
+}
+
+const AUTH_ERROR_USER_MESSAGE =
+  'Claude CLI is not logged in. Run `claude auth login`, then restart the bridge.';
+
+// ── Cross-runtime model guard ──
+
+const NON_CLAUDE_MODEL_RE = /^(gpt-|o[1-9][-_]|codex[-_]|davinci|text-|openai\/)/i;
+
+/** Return true if a model name clearly belongs to a non-Claude provider. */
+export function isNonClaudeModel(model?: string): boolean {
+  return !!model && NON_CLAUDE_MODEL_RE.test(model);
+}
 /**
  * Build a clean env for the CLI subprocess.
  *
@@ -74,6 +98,31 @@ export function buildSubprocessEnv(): Record<string, string> {
   }
 
   return out;
+}
+
+// ── Claude CLI preflight check ──
+
+/**
+ * Run a lightweight preflight check to verify the claude CLI can start.
+ * Spawns `claude --version` with a clean env and short timeout.
+ * Returns { ok, version?, error? }.
+ */
+export function preflightCheck(cliPath: string): { ok: boolean; version?: string; error?: string } {
+  const cleanEnv = buildSubprocessEnv();
+  try {
+    const output = execSync(`"${cliPath}" --version`, {
+      encoding: 'utf-8',
+      timeout: 10_000,
+      env: cleanEnv,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim();
+    return { ok: true, version: output };
+  } catch (err) {
+    const e = err as { status?: number; stderr?: string; message?: string };
+    const stderr = typeof e.stderr === 'string' ? e.stderr.trim() : '';
+    const detail = stderr || e.message || 'unknown error';
+    return { ok: false, error: `claude CLI exited with code ${e.status ?? '?'}: ${detail}` };
+  }
 }
 
 // ── Claude CLI path resolution ──
@@ -190,17 +239,35 @@ export class SDKLLMProvider implements LLMProvider {
     return new ReadableStream({
       start(controller) {
         (async () => {
+          // Ring-buffer for recent stderr output (max 4 KB)
+          const MAX_STDERR = 4096;
+          let stderrBuf = '';
+
           try {
             const cleanEnv = buildSubprocessEnv();
 
+            // Cross-runtime migration safety: drop non-Claude model names
+            // that may linger in session data from a previous Codex runtime.
+            let model = params.model;
+            if (isNonClaudeModel(model)) {
+              console.warn(`[llm-provider] Ignoring non-Claude model "${model}", using CLI default`);
+              model = undefined;
+            }
+
             const queryOptions: Record<string, unknown> = {
               cwd: params.workingDirectory,
-              model: params.model,
+              model,
               resume: params.sdkSessionId || undefined,
               abortController: params.abortController,
               permissionMode: (params.permissionMode as 'default' | 'acceptEdits' | 'plan') || undefined,
               includePartialMessages: true,
               env: cleanEnv,
+              stderr: (data: string) => {
+                stderrBuf += data;
+                if (stderrBuf.length > MAX_STDERR) {
+                  stderrBuf = stderrBuf.slice(-MAX_STDERR);
+                }
+              },
               canUseTool: async (
                   toolName: string,
                   input: Record<string, unknown>,
@@ -253,8 +320,29 @@ export class SDKLLMProvider implements LLMProvider {
             const message = err instanceof Error ? err.message : String(err);
             // Log full error (including stack) to bridge log for debugging
             console.error('[llm-provider] SDK query error:', err instanceof Error ? err.stack || err.message : err);
-            // Send simplified but actionable summary to IM
-            controller.enqueue(sseEvent('error', message));
+            if (stderrBuf) {
+              console.error('[llm-provider] stderr from CLI:', stderrBuf.trim());
+            }
+
+            // Detect auth errors from error message or captured stderr
+            let userMessage = message;
+            if (isAuthError(message) || isAuthError(stderrBuf)) {
+              userMessage = AUTH_ERROR_USER_MESSAGE;
+            } else if (message.includes('process exited with code')) {
+              const lines = [
+                message,
+                '',
+                'Possible causes:',
+                '• Claude CLI not authenticated — run: claude auth login',
+                '• Claude CLI version incompatible with SDK — run: claude --version',
+                '• Missing environment variables in daemon context',
+                '',
+                'Diagnostics: check ~/.claude-to-im/logs/bridge.log',
+              ];
+              userMessage = lines.join('\n');
+            }
+
+            controller.enqueue(sseEvent('error', userMessage));
             controller.close();
           }
         })();

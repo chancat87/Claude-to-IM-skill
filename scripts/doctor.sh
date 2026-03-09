@@ -52,9 +52,27 @@ if [ "$CTI_RUNTIME" = "claude" ] || [ "$CTI_RUNTIME" = "auto" ]; then
     fi
   fi
 
+  # --- Claude CLI authenticated ---
+  if command -v claude &>/dev/null; then
+    AUTH_OUT=$(claude auth status 2>&1 || true)
+    if echo "$AUTH_OUT" | grep -qiE 'loggedIn.*true|logged.in'; then
+      check "Claude CLI authenticated" 0
+    else
+      check "Claude CLI authenticated (run 'claude auth login')" 1
+    fi
+  fi
+
   # --- SDK cli.js resolvable ---
-  SDK_CLI="$SKILL_DIR/node_modules/@anthropic-ai/claude-agent-sdk/dist/cli.js"
-  if [ -f "$SDK_CLI" ]; then
+  SDK_CLI=""
+  for candidate in \
+    "$SKILL_DIR/node_modules/@anthropic-ai/claude-agent-sdk/cli.js" \
+    "$SKILL_DIR/node_modules/@anthropic-ai/claude-agent-sdk/dist/cli.js"; do
+    if [ -f "$candidate" ]; then
+      SDK_CLI="$candidate"
+      break
+    fi
+  done
+  if [ -n "$SDK_CLI" ]; then
     check "Claude SDK cli.js exists ($SDK_CLI)" 0
   else
     if [ "$CTI_RUNTIME" = "claude" ]; then
